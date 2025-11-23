@@ -28,7 +28,6 @@ from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq,
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 import wandb
-wandb.init(project="3dcavla-oft-experiments")
 
 from experiments.robot.openvla_utils import (
     check_model_logic_mismatch,
@@ -104,8 +103,8 @@ class FinetuneConfig:
     save_freq: int = 10_000                          # Checkpoint saving frequency in steps
     save_latest_checkpoint_only: bool = False        # If True, saves only 1 checkpoint, overwriting latest checkpoint
                                                      #   (If False, saves all checkpoints)
-    resume: bool = False                             # If True, resumes from checkpoint
-    resume_step: Optional[int] = None                # (When `resume==True`) Step number that we are resuming from
+    resume: bool = True                             # If True, resumes from checkpoint
+    resume_step: Optional[int] = 70000                # (When `resume==True`) Step number that we are resuming from
     image_aug: bool = True                           # If True, trains with image augmentations (HIGHLY RECOMMENDED)
     diffusion_sample_freq: int = 50                  # (When `use_diffusion==True`) Frequency for sampling in steps
 
@@ -699,7 +698,7 @@ def save_training_checkpoint(
             merged_vla = merged_vla.merge_and_unload()
 
             merged_vla.save_pretrained(checkpoint_dir)
-            print(f"Saved merged model for Step {log_step} at: {checkpoint_dir})
+            print(f"Saved merged model for Step {log_step} at: {checkpoint_dir}")
 
         # Wait for merged model to be saved
         dist.barrier()
@@ -852,10 +851,25 @@ def finetune(cfg: FinetuneConfig) -> None:
     # the file to the downloaded or locally stored checkpoint directory so
     # that the user's changes to the VLA class logic go into effect
     if model_is_on_hf_hub(cfg.vla_path):
-        # Download model directly from Hugging Face Hub
-        vla_download_path = snapshot_download(repo_id=cfg.vla_path)
-        # Overwrite VLA path
-        cfg.vla_path = vla_download_path
+        # # Download model directly from Hugging Face Hub
+        # vla_download_path = snapshot_download(repo_id=cfg.vla_path)
+        # # Overwrite VLA path
+        # cfg.vla_path = vla_download_path
+        # Only the main process should perform the download to avoid concurrent downloads
+        download_marker = os.path.join(run_dir, "vla_download_path.txt")
+        if distributed_state.is_main_process:
+            vla_download_path = snapshot_download(repo_id=cfg.vla_path)
+            # Overwrite VLA path on main process
+            cfg.vla_path = vla_download_path
+            # Write the resolved path for other processes to read after the barrier
+            with open(download_marker, "w") as f:
+                f.write(vla_download_path)
+        # Wait until main process finishes download and writes the marker
+        dist.barrier()
+        # Non-main processes read the marker to get the downloaded path
+        if not distributed_state.is_main_process:
+            with open(download_marker, "r") as f:
+                cfg.vla_path = f.read().strip()
     else:
         # Register OpenVLA model to HF Auto Classes (not needed if the model is on HF Hub)
         AutoConfig.register("openvla", OpenVLAConfig)
@@ -936,14 +950,14 @@ def finetune(cfg: FinetuneConfig) -> None:
     if cfg.use_depth:
         depth_projector1 = init_module(
             PointNetfeat,
-            'depth_projector',
+            'depth_projector1',
             cfg,
             device_id,
             {},
         )
         depth_projector2 = init_module(
             PointNetfeat,
-            'depth_projector',
+            'depth_projector2',
             cfg,
             device_id,
             {},
@@ -1171,6 +1185,22 @@ def finetune(cfg: FinetuneConfig) -> None:
                 scheduler.step()
                 optimizer.zero_grad()
                 progress.update()
+                # Print per-gradient-step loss and a few metrics to stdout for quick monitoring
+                try:
+                    # Prefer smoothed loss if available, otherwise fall back to most recent metric
+                    step_loss = smoothened_metrics.get("loss_value") if isinstance(smoothened_metrics, dict) else None
+                    if step_loss is None:
+                        step_loss = metrics.get("loss_value") if isinstance(metrics, dict) and "loss_value" in metrics else float(loss.item())
+                except Exception:
+                    step_loss = float(loss.item())
+
+                # Determine visible rank for printing
+                try:
+                    rank_id = distributed_state.local_process_index
+                except Exception:
+                    rank_id = device_id
+
+                print(f"[Rank {rank_id}] Step {log_step} - Loss: {step_loss:.6f}")
 
             # Save model checkpoint: either keep latest checkpoint only or all checkpoints
             if gradient_step_idx > 0 and log_step % cfg.save_freq == 0:

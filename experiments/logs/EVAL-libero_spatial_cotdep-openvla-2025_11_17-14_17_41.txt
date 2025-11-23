@@ -1,0 +1,5 @@
+Task suite: libero_spatial_cotdep
+Using default initial states
+
+Task: locate black bowl between plate and ramekin,grab black bowl by rim,place it in middle of plate
+Starting episode 1...

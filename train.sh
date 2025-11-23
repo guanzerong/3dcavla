@@ -1,13 +1,15 @@
 
 # Run 3D-CAVLA default fine-tuning on one of the LIBERO datasets
-
-torchrun --standalone --nnodes 1 --nproc-per-node 1 vla-scripts/finetune.py \
-  --vla_path openvla/openvla-7b \
-  --data_root_dir "<path_to_modified_libero_rlds_cotdep>" \
+export WANDB_MODE=offline
+export WANDB_SILENT=true
+export CUDA_VISIBLE_DEVICES=1,2
+torchrun --standalone --nnodes 1 --nproc-per-node 2 vla-scripts/finetune.py \
+  --vla_path /data_all/gzr1/3dcavla/runs/openvla-7b+libero_spatial_cotdep+b8+lr-5e-05+lora-r32+dropout-0.0--image_aug--libero-spatial-cotdep-3dcavla--70000_chkpt\
+  --data_root_dir /data_all/gzr1/datasets/modified_libero_rlds_cotdep \
   --dataset_name libero_spatial_cotdep \
   --run_root_dir ./runs \
   --use_l1_regression True \
-  --use_diffusion False \
+  --use_diffusion   False \
   --use_film False \
   --num_images_in_input 2 \
   --use_proprio True \
@@ -16,7 +18,7 @@ torchrun --standalone --nnodes 1 --nproc-per-node 1 vla-scripts/finetune.py \
   --learning_rate 5e-5 \
   --num_steps_before_decay 100000 \
   --max_steps 150005 \
-  --save_freq 50000 \
+  --save_freq 10000 \
   --save_latest_checkpoint_only False \
   --image_aug True \
   --lora_rank 32 \
