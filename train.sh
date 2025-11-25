@@ -3,6 +3,7 @@
 export WANDB_MODE=offline
 export WANDB_SILENT=true
 export CUDA_VISIBLE_DEVICES=4
+#ssssss
 torchrun --standalone --nnodes 1 --nproc-per-node 1 vla-scripts/finetune.py \
   --vla_path openvla/openvla-7b\
   --data_root_dir /data_all/gzr1/datasets/modified_libero_rlds_cotdep \
