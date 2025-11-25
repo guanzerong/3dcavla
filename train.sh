@@ -2,9 +2,9 @@
 # Run 3D-CAVLA default fine-tuning on one of the LIBERO datasets
 export WANDB_MODE=offline
 export WANDB_SILENT=true
-export CUDA_VISIBLE_DEVICES=1,2
-torchrun --standalone --nnodes 1 --nproc-per-node 2 vla-scripts/finetune.py \
-  --vla_path /data_all/gzr1/3dcavla/runs/openvla-7b+libero_spatial_cotdep+b8+lr-5e-05+lora-r32+dropout-0.0--image_aug--libero-spatial-cotdep-3dcavla--70000_chkpt\
+export CUDA_VISIBLE_DEVICES=4
+torchrun --standalone --nnodes 1 --nproc-per-node 1 vla-scripts/finetune.py \
+  --vla_path openvla/openvla-7b\
   --data_root_dir /data_all/gzr1/datasets/modified_libero_rlds_cotdep \
   --dataset_name libero_spatial_cotdep \
   --run_root_dir ./runs \

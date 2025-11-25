@@ -103,7 +103,7 @@ class FinetuneConfig:
     save_freq: int = 10_000                          # Checkpoint saving frequency in steps
     save_latest_checkpoint_only: bool = False        # If True, saves only 1 checkpoint, overwriting latest checkpoint
                                                      #   (If False, saves all checkpoints)
-    resume: bool = True                             # If True, resumes from checkpoint
+    resume: bool = False                             # If True, resumes from checkpoint
     resume_step: Optional[int] = 70000                # (When `resume==True`) Step number that we are resuming from
     image_aug: bool = True                           # If True, trains with image augmentations (HIGHLY RECOMMENDED)
     diffusion_sample_freq: int = 50                  # (When `use_diffusion==True`) Frequency for sampling in steps
