@@ -576,8 +576,14 @@ def get_action_head(cfg: Any, llm_dim: int) -> Union[L1RegressionActionHead, Dif
     if cfg.use_l1_regression:
         action_head = L1RegressionActionHead(input_dim=llm_dim, hidden_dim=llm_dim, action_dim=ACTION_DIM)
     elif cfg.use_diffusion:
+        # OpenPI-style diffusion action head with Transformer action expert
         action_head = DiffusionActionHead(
-            input_dim=llm_dim, hidden_dim=llm_dim, action_dim=ACTION_DIM, num_diffusion_steps=cfg.num_diffusion_steps
+            input_dim=llm_dim,
+            hidden_dim=1024,  # OpenPI action expert uses width=1024 (gemma_300m)
+            action_dim=ACTION_DIM,
+            num_diffusion_steps=cfg.num_diffusion_steps,
+            num_transformer_blocks=18,  # 12 blocks (~160M params), use 18 for ~236M (closer to OpenPI)
+            num_heads=8,
         )
     else:
         raise ValueError("Either use_l1_regression or use_diffusion must be True")

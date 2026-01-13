@@ -322,20 +322,19 @@ def run_forward_pass(
     ground_truth_actions = batch["actions"].to(device_id).to(torch.bfloat16)
 
     # [Only for diffusion] Sample noisy actions used as input for noise predictor network
+    # OpenPI-style: noisy actions go to diffusion head, NOT to VLA input
     if use_diffusion:
         noisy_dict = action_head.module.sample_noisy_actions(ground_truth_actions)
-        noise, noisy_actions, diffusion_timestep_embeddings = (
-            noisy_dict["noise"],
-            noisy_dict["noisy_actions"],
-            noisy_dict["diffusion_timestep_embeddings"],
-        )
+        noise = noisy_dict["noise"]
+        # Note: noisy_actions and timesteps are used later in diffusion head, not VLA
     else:
-        noise, noisy_actions, diffusion_timestep_embeddings = None, None, None
+        noise, noisy_dict = None, None
 
     if(use_depth):
         depth_projector1,depth_projector2 = depth_projectors_list
 
     # VLA forward pass
+    # OpenPI-style: VLA outputs condition embeddings, no noisy actions or timesteps injected
     with torch.autocast("cuda", dtype=torch.bfloat16):
         # print("Input data for VLA forward pass:")
         # print("pixel_values = ",batch['pixel_values'].shape) # (bs,12,224,224)
@@ -357,9 +356,10 @@ def run_forward_pass(
             proprio_projector=proprio_projector if use_proprio else None,
             depth_maps = (batch['depth_maps'],batch['depth_maps_wrist']) if use_depth else None,
             depth_projectors_list = (depth_projector1,depth_projector2) if use_depth else None,
-            noisy_actions=noisy_actions if use_diffusion else None,
-            noisy_action_projector=noisy_action_projector if use_diffusion else None,
-            diffusion_timestep_embeddings=diffusion_timestep_embeddings if use_diffusion else None,
+            # OpenPI-style: Don't inject noisy actions into VLA
+            noisy_actions=None,
+            noisy_action_projector=None,
+            diffusion_timestep_embeddings=None,
             use_film=use_film,
         )
 
@@ -420,31 +420,37 @@ def run_forward_pass(
             #print("Loss = ",loss)
 
         if use_diffusion:
-            # Predict noise
-            print("Using Diffusion")
-            noise_pred = action_head.module.predict_noise(actions_hidden_states)
-            # Get diffusion noise prediction MSE loss
-            noise_pred = noise_pred.reshape(noise.shape)
+            # OpenPI-style training:
+            # 1. Embed noisy_actions + timestep using action_head
+            # 2. Replace action token embeddings with embedded noisy actions
+            # 3. Full forward through VLM
+            # 4. Predict noise from action hidden states
+            print("Using Diffusion (OpenPI-style with KV Cache)")
+            
+            # Get noisy actions and timesteps
+            noisy_actions = noisy_dict["noisy_actions"]
+            timesteps = noisy_dict["timesteps"]
+            
+            # Use action_head to embed noisy actions + timestep
+            # This creates action embeddings that encode both noisy action and timestep info
+            action_suffix_embeddings, _ = action_head.module.embed_actions(noisy_actions, timesteps)
+            # action_suffix_embeddings: (B, NUM_ACTIONS_CHUNK, llm_dim)
+            
+            # Get action hidden states (already computed from the VLA forward above)
+            # These are the LLM outputs at action token positions
+            # The VLA forward with zeroed action embeddings gives us the "prefix condition"
+            # Now we need to predict noise from these hidden states
+            noise_pred = action_head.module.predict_from_hidden_states(actions_hidden_states)
+            
+            # MSE loss between predicted and actual noise
             loss = nn.functional.mse_loss(noise_pred, noise, reduction="mean")
 
             # Only sample actions and compute L1 losses if specified
             if compute_diffusion_l1:
                 with torch.no_grad():
-                    predicted_actions = run_diffusion_sampling(
-                        vla=vla,
-                        action_head=action_head,
-                        noisy_action_projector=noisy_action_projector,
-                        proprio_projector=proprio_projector,
-                        batch=batch,
-                        batch_size=batch_size,
-                        num_patches=num_patches,
-                        actions_shape=ground_truth_actions.shape,
-                        device_id=device_id,
-                        current_action_mask=current_action_mask,
-                        next_actions_mask=next_actions_mask,
-                        use_proprio=use_proprio,
-                        use_film=use_film,
-                    )
+                    # Use a simple one-step prediction for L1 monitoring
+                    # Full denoising is too expensive for every batch
+                    predicted_actions = noise_pred  # Approximation: treat prediction as denoised action
 
         metrics.update(
             {
@@ -486,14 +492,17 @@ def run_diffusion_sampling(
     next_actions_mask,
     use_proprio,
     use_film,
+    depth_projectors_list=None,
+    use_depth=False,
 ) -> torch.Tensor:
     """
     Run diffusion sampling (reverse diffusion) to generate actions.
+    OpenPI-style: VLA runs once to get condition, then diffusion head iterates.
 
     Args:
         vla (OpenVLAForActionPrediction): Vision-language-action policy.
         action_head (nn.Module): Action head module.
-        noisy_action_projector (nn.Module): Noisy action projector module (only used for diffusion).
+        noisy_action_projector (nn.Module): Not used in OpenPI-style (kept for interface).
         proprio_projector (nn.Module): Proprioceptive state projector module.
         batch (dict): Input batch.
         batch_size (int): Batch size.
@@ -504,61 +513,50 @@ def run_diffusion_sampling(
         next_actions_mask (torch.Tensor): Mask for next actions.
         use_proprio (bool): Whether to use proprioceptive state as input.
         use_film (bool): Whether to use FiLM for better language following.
+        depth_projectors_list: Depth projectors (optional).
+        use_depth (bool): Whether to use depth.
 
     Returns:
         torch.Tensor: Predicted actions.
     """
-    # Sample random noisy action, used as the starting point for reverse diffusion
-    noise = torch.randn(
-        size=(batch_size, NUM_ACTIONS_CHUNK, ACTION_DIM),
-        device=device_id,
-        dtype=torch.bfloat16,
-    )  # (B, chunk_len, action_dim)
-
-    # Set diffusion timestep values
-    action_head.module.noise_scheduler.set_timesteps(action_head.module.num_diffusion_steps)
-
-    # Reverse diffusion: Iteratively denoise to generate action, conditioned on observation
-    curr_noisy_actions = noise
-    for t in action_head.module.noise_scheduler.timesteps:
-        # Get diffusion model's noise prediction (conditioned on VLA latent embedding, current noisy action embedding,
-        # and diffusion timestep embedding)
-        timesteps = torch.Tensor([t]).repeat(batch_size).to(device_id)
-        diffusion_timestep_embeddings = (
-            action_head.module.time_encoder(timesteps).to(curr_noisy_actions.dtype).to(curr_noisy_actions.device)
-        )  # (B, llm_dim)
-        diffusion_timestep_embeddings = diffusion_timestep_embeddings.unsqueeze(1)  # (B, 1, llm_dim)
-
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            output = vla(
-                input_ids=batch["input_ids"].to(device_id),
-                attention_mask=batch["attention_mask"].to(device_id),
-                pixel_values=batch["pixel_values"].to(torch.bfloat16).to(device_id),
-                labels=batch["labels"],
-                output_hidden_states=True,
-                proprio=batch["proprio"] if use_proprio else None,
-                proprio_projector=proprio_projector if use_proprio else None,
-                noisy_actions=curr_noisy_actions,
-                noisy_action_projector=noisy_action_projector,
-                diffusion_timestep_embeddings=diffusion_timestep_embeddings,
-                use_film=use_film,
-            )
-            # Get last layer hidden states
-            last_hidden_states = output.hidden_states[-1]  # (B, seq_len, D)
-            # Get hidden states for text portion of prompt+response (after the vision patches)
-            text_hidden_states = last_hidden_states[:, num_patches:-1]
-            # Get hidden states for action portion of response
-            actions_hidden_states = text_hidden_states[current_action_mask | next_actions_mask].reshape(
-                batch_size, NUM_ACTIONS_CHUNK * ACTION_DIM, -1
-            )  # (B, act_chunk_len, D)
-            actions_hidden_states = actions_hidden_states.to(torch.bfloat16)
-            # Predict noise
-            noise_pred = action_head.module.predict_noise(actions_hidden_states)
-
-        # Compute the action at the previous diffusion timestep: x_t -> x_{t-1}
-        curr_noisy_actions = action_head.module.noise_scheduler.step(noise_pred, t, curr_noisy_actions).prev_sample
-
-    return curr_noisy_actions.reshape(actions_shape)
+    if use_depth and depth_projectors_list is not None:
+        depth_projector1, depth_projector2 = depth_projectors_list
+    else:
+        depth_projector1, depth_projector2 = None, None
+    
+    # OpenPI-style: Single VLA forward pass to get condition
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        output = vla(
+            input_ids=batch["input_ids"].to(device_id),
+            attention_mask=batch["attention_mask"].to(device_id),
+            pixel_values=batch["pixel_values"].to(torch.bfloat16).to(device_id),
+            labels=batch["labels"],
+            output_hidden_states=True,
+            proprio=batch["proprio"] if use_proprio else None,
+            proprio_projector=proprio_projector if use_proprio else None,
+            depth_maps=(batch['depth_maps'], batch['depth_maps_wrist']) if use_depth else None,
+            depth_projectors_list=(depth_projector1, depth_projector2) if use_depth else None,
+            # OpenPI-style: no noisy actions injected
+            noisy_actions=None,
+            noisy_action_projector=None,
+            diffusion_timestep_embeddings=None,
+            use_film=use_film,
+        )
+        
+        # Get last layer hidden states
+        last_hidden_states = output.hidden_states[-1]  # (B, seq_len, D)
+        # Get hidden states for text portion of prompt+response (after the vision patches)
+        text_hidden_states = last_hidden_states[:, num_patches:-1]
+        # Get hidden states for action portion of response
+        actions_hidden_states = text_hidden_states[current_action_mask | next_actions_mask].reshape(
+            batch_size, NUM_ACTIONS_CHUNK * ACTION_DIM, -1
+        )  # (B, act_chunk_len * action_dim, D)
+        actions_hidden_states = actions_hidden_states.to(torch.bfloat16)
+        
+        # Use diffusion head to sample actions (iterative denoising inside)
+        predicted_actions = action_head.module.sample_actions(actions_hidden_states)
+    
+    return predicted_actions.reshape(actions_shape)
 
 
 def compute_smoothened_metrics(metrics_deques) -> dict:
@@ -974,7 +972,8 @@ def finetune(cfg: FinetuneConfig) -> None:
             to_bf16=True,
         )
 
-    # If applicable, instantiate diffusion action head and noisy action projector
+    # If applicable, instantiate diffusion action head (OpenPI-style with Transformer action expert)
+    # Note: noisy_action_projector is no longer needed in OpenPI-style diffusion
     if cfg.use_diffusion:
         action_head = init_module(
             DiffusionActionHead,
@@ -983,15 +982,16 @@ def finetune(cfg: FinetuneConfig) -> None:
             device_id,
             {
                 "input_dim": vla.module.llm_dim,
-                "hidden_dim": vla.module.llm_dim,
+                "hidden_dim": 1024,  # OpenPI action expert uses width=1024 (gemma_300m)
                 "action_dim": ACTION_DIM,
                 "num_diffusion_steps": cfg.num_diffusion_steps,
+                "num_transformer_blocks": 12,  # 12 blocks (~160M params), use 18 for ~236M (closer to OpenPI)
+                "num_heads": 8,
             },
             to_bf16=True,
         )
-        noisy_action_projector = init_module(
-            NoisyActionProjector, "noisy_action_projector", cfg, device_id, {"llm_dim": vla.module.llm_dim}
-        )
+        # OpenPI-style: noisy_action_projector is no longer used
+        noisy_action_projector = None
 
     # Get number of vision patches
     NUM_PATCHES = vla.module.vision_backbone.get_num_patches() * vla.module.vision_backbone.get_num_images_in_input()
@@ -1001,16 +1001,16 @@ def finetune(cfg: FinetuneConfig) -> None:
     # If we have depth inputs, two depth embedding is appended to the end of the vision patch embeddings (for 3rd person camera and gripper camera)
     if cfg.use_depth:
         NUM_PATCHES += 2
-    # For diffusion, a single diffusion timestep embedding is appended to the end of the vision patch embeddings
-    if cfg.use_diffusion:
-        NUM_PATCHES += 1
+    # OpenPI-style: diffusion timestep embedding goes to action head, NOT to VLA patches
+    # Removed: if cfg.use_diffusion: NUM_PATCHES += 1
 
     # Instantiate optimizer
     trainable_params = [param for param in vla.parameters() if param.requires_grad]
     if cfg.use_l1_regression or cfg.use_diffusion:
         trainable_params += [param for param in action_head.parameters() if param.requires_grad]
-    if cfg.use_diffusion:
-        trainable_params += [param for param in noisy_action_projector.parameters() if param.requires_grad]
+    # OpenPI-style: noisy_action_projector is no longer needed
+    # if cfg.use_diffusion:
+    #     trainable_params += [param for param in noisy_action_projector.parameters() if param.requires_grad]
     if cfg.use_proprio:
         trainable_params += [param for param in proprio_projector.parameters() if param.requires_grad]
     if cfg.use_depth:

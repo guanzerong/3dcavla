@@ -717,15 +717,18 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
 
             # print("Shape of projected patch embeddings after proprioception and depth features 1 & 2= ",projected_patch_embeddings.shape) # (bs,515,4096)
 
-            # [Diffusion] Add diffusion timestep embedding if provided
-            if diffusion_timestep_embeddings is not None:
-                # For simplicity, just append diffusion timestep embedding to the end of projected vision patch tokens
-                projected_patch_embeddings = torch.cat(
-                    (projected_patch_embeddings, diffusion_timestep_embeddings), dim=1
-                )
+            # [OpenPI-style Diffusion] No longer add diffusion timestep embedding to VLA input
+            # The VLA outputs condition, and diffusion head handles noise/timestep internally
+            # if diffusion_timestep_embeddings is not None:
+            #     # For simplicity, just append diffusion timestep embedding to the end of projected vision patch tokens
+            #     projected_patch_embeddings = torch.cat(
+            #         (projected_patch_embeddings, diffusion_timestep_embeddings), dim=1
+            #     )
 
-            # Process action embeddings
-            if noisy_actions is not None:
+            # Process action embeddings - for openpi-style diffusion, we don't inject noisy actions into VLA
+            if noisy_actions is not None and noisy_action_projector is not None:
+                # Legacy path: inject noisy actions into VLA (original approach)
+                # This path is kept for backward compatibility but not recommended
                 # Get mask corresponding to all action tokens
                 all_actions_mask = self._process_action_masks(labels)
 
@@ -742,8 +745,8 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
                     input_embeddings, all_actions_mask, noisy_action_features
                 )
             else:
-                # Replace the embeddings of the action tokens with zeros
-                # (Later on, the positional embeddings will be added to them)
+                # OpenPI-style: Zero out action token embeddings
+                # VLA will produce condition embeddings, diffusion head handles denoising
                 all_actions_mask = all_actions_mask.unsqueeze(-1)  # (B, seq_len, 1)
                 input_embeddings = input_embeddings * ~all_actions_mask
 
@@ -917,6 +920,139 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
 
         return actions
 
+    def _run_diffusion_prediction_with_kv_cache(
+        self,
+        input_embeddings,
+        all_actions_mask,
+        action_head,
+        projected_patch_embeddings,
+        attention_mask,
+        NUM_PATCHES,
+        NUM_PROMPT_TOKENS,
+    ):
+        """
+        Run diffusion-based action prediction with KV Cache (True OpenPI-style).
+        
+        Architecture:
+        1. Prefix forward: Run VLM on (BOS + vision + prompt), cache KV
+        2. For each denoising step:
+           - Create action suffix embeddings from noisy_actions + timestep
+           - Run VLM suffix forward using KV cache
+           - Predict noise from suffix hidden states
+           - Update noisy_actions
+        
+        This allows action tokens to attend to vision/language via cached KV.
+        """
+        batch_size = input_embeddings.shape[0]
+        device = input_embeddings.device
+        dtype = input_embeddings.dtype
+        
+        # === Step 1: Prepare prefix (everything except action tokens) ===
+        # Zero out action tokens in input embeddings
+        all_actions_mask_expanded = all_actions_mask.unsqueeze(-1)  # (B, seq_len, 1)
+        prefix_input_embeddings = input_embeddings * ~all_actions_mask_expanded
+        
+        # Build multimodal embeddings: [BOS, vision_patches, prompt_tokens, zeros_for_actions, STOP]
+        multimodal_embeddings, multimodal_attention_mask = self._build_multimodal_attention(
+            prefix_input_embeddings, projected_patch_embeddings, attention_mask
+        )
+        
+        # Calculate prefix length (everything before action tokens)
+        # multimodal_embeddings: [BOS (1), vision_patches (NUM_PATCHES), prompt (NUM_PROMPT_TOKENS), ...]
+        prefix_len = 1 + NUM_PATCHES + NUM_PROMPT_TOKENS
+        
+        # Extract prefix embeddings and mask
+        prefix_embeddings = multimodal_embeddings[:, :prefix_len, :]  # (B, prefix_len, D)
+        prefix_attention_mask = multimodal_attention_mask[:, :prefix_len] if multimodal_attention_mask is not None else None
+        
+        # === Step 2: Run prefix through LLM to get KV Cache ===
+        prefix_output = self.language_model(
+            input_ids=None,
+            attention_mask=prefix_attention_mask,
+            position_ids=None,
+            past_key_values=None,
+            inputs_embeds=prefix_embeddings,
+            labels=None,
+            use_cache=True,  # Enable KV caching
+            output_attentions=False,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        kv_cache = prefix_output.past_key_values
+        
+        # === Step 3: Iterative denoising with KV Cache ===
+        action_head.noise_scheduler.set_timesteps(action_head.num_diffusion_steps)
+        
+        # Start from pure noise
+        noisy_actions = torch.randn(
+            size=(batch_size, NUM_ACTIONS_CHUNK, ACTION_DIM),
+            device=device,
+            dtype=dtype,
+        )
+        
+        for t in action_head.noise_scheduler.timesteps:
+            timesteps = torch.full((batch_size,), t, device=device, dtype=torch.long)
+            
+            # Create action suffix embeddings using action_head
+            action_suffix_embeddings, _ = action_head.embed_actions(noisy_actions, timesteps)
+            # action_suffix_embeddings: (B, NUM_ACTIONS_CHUNK, llm_dim)
+            
+            # Prepare attention mask for suffix
+            # Suffix tokens can attend to: all prefix tokens + all suffix tokens
+            suffix_len = NUM_ACTIONS_CHUNK
+            total_len = prefix_len + suffix_len
+            
+            # Create causal mask for suffix attending to prefix + suffix
+            if prefix_attention_mask is not None:
+                # Full attention mask: (B, suffix_len, prefix_len + suffix_len)
+                # Suffix can attend to all prefix and causally to suffix
+                suffix_attention_mask = torch.ones(
+                    (batch_size, suffix_len),
+                    device=device,
+                    dtype=prefix_attention_mask.dtype,
+                )
+                full_attention_mask = torch.cat([prefix_attention_mask, suffix_attention_mask], dim=1)
+            else:
+                full_attention_mask = None
+            
+            # Create position ids for suffix (continuing from prefix)
+            suffix_position_ids = torch.arange(
+                prefix_len, prefix_len + suffix_len, device=device
+            ).unsqueeze(0).expand(batch_size, -1)
+            
+            # Run suffix through LLM using KV cache
+            suffix_output = self.language_model(
+                input_ids=None,
+                attention_mask=full_attention_mask,
+                position_ids=suffix_position_ids,
+                past_key_values=kv_cache,
+                inputs_embeds=action_suffix_embeddings,
+                labels=None,
+                use_cache=False,  # Don't update cache during denoising
+                output_attentions=False,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+            
+            # Get hidden states for action tokens
+            suffix_hidden_states = suffix_output.hidden_states[-1]  # (B, suffix_len, D)
+            
+            # Predict noise from hidden states
+            noise_pred = action_head.predict_from_hidden_states(suffix_hidden_states)
+            
+            # Denoise step
+            noisy_actions = action_head.noise_scheduler.step(
+                noise_pred, t, noisy_actions
+            ).prev_sample
+        
+        # Reshape output - keep batch dimension
+        predicted_actions = noisy_actions.reshape(batch_size, NUM_ACTIONS_CHUNK, ACTION_DIM)
+        
+        # Return first sample for single batch (compatibility with existing code)
+        if batch_size == 1:
+            return predicted_actions[0].float().cpu().detach().numpy(), suffix_hidden_states
+        return predicted_actions.float().cpu().detach().numpy(), suffix_hidden_states
+
     def _run_diffusion_prediction(
         self,
         input_embeddings,
@@ -928,80 +1064,20 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         attention_mask,
         NUM_PATCHES,
         NUM_PROMPT_TOKENS,
-        noisy_action_projector,
+        noisy_action_projector=None,
     ):
-        """Run diffusion-based action prediction"""
-        # Set diffusion timestep values
-        action_head.noise_scheduler.set_timesteps(action_head.num_diffusion_steps)
-        # Clone embedding for reuse in each timestep
-        orig_projected_patch_embeddings = projected_patch_embeddings.clone()
-        curr_noisy_actions = noise
-
-        # Reverse diffusion: Iteratively denoise to generate action prediction
-        for t in action_head.noise_scheduler.timesteps:
-            # Get diffusion model's noise prediction (conditioned on VLA latent embedding, current noisy action
-            # embedding, and diffusion timestep embedding)
-            timesteps = torch.Tensor([t]).to(labels.device)
-            diffusion_timestep_embeddings = (
-                action_head.time_encoder(timesteps).to(curr_noisy_actions.dtype).to(curr_noisy_actions.device)
-            )  # (B, llm_dim)
-            diffusion_timestep_embeddings = diffusion_timestep_embeddings.unsqueeze(1)  # (B, 1, llm_dim)
-
-            # [Diffusion] Replace the embeddings of the action tokens with noisy actions
-            # (Later on, the positional embeddings will be added to them)
-
-            # For simplicity, append diffusion timestep embedding to the end of projected vision tokens
-            projected_patch_embeddings = torch.cat(
-                (orig_projected_patch_embeddings, diffusion_timestep_embeddings), dim=1
-            )
-
-            # Reshape and project noisy actions into language embedding space
-            B = curr_noisy_actions.shape[0]
-            orig_curr_noisy_actions_shape = curr_noisy_actions.shape
-            curr_noisy_actions = curr_noisy_actions.reshape(B, -1).unsqueeze(-1)
-            noisy_action_features = noisy_action_projector(curr_noisy_actions)
-            curr_noisy_actions = curr_noisy_actions.reshape(orig_curr_noisy_actions_shape)
-
-            # Replace action token embeddings with noisy action embeddings
-            input_embeddings = self._replace_input_embeddings(
-                input_embeddings.clone(), all_actions_mask, noisy_action_features
-            )
-
-            # Build multimodal embeddings and attention mask
-            multimodal_embeddings, multimodal_attention_mask = self._build_multimodal_attention(
-                input_embeddings, projected_patch_embeddings, attention_mask
-            )
-
-            # Forward pass through language model
-            language_model_output = self.language_model(
-                input_ids=None,
-                attention_mask=multimodal_attention_mask,
-                position_ids=None,
-                past_key_values=None,
-                inputs_embeds=multimodal_embeddings,
-                labels=None,
-                use_cache=None,
-                output_attentions=False,
-                output_hidden_states=True,
-                return_dict=True,
-            )
-
-            # Extract hidden states for action portion of response
-            last_hidden_states = language_model_output.hidden_states[-1]  # (B, seq_len, D)
-            actions_hidden_states = last_hidden_states[
-                :,
-                NUM_PATCHES + NUM_PROMPT_TOKENS : NUM_PATCHES + NUM_PROMPT_TOKENS + ACTION_DIM * NUM_ACTIONS_CHUNK,
-                :,
-            ]  # (B, act_chunk_len, D)
-
-            # Predict noise and update noisy actions: x_t -> x_{t-1}
-            noise_pred = action_head.predict_noise(actions_hidden_states)
-            curr_noisy_actions = action_head.noise_scheduler.step(noise_pred, t, curr_noisy_actions).prev_sample
-
-        curr_noisy_actions = curr_noisy_actions.reshape(NUM_ACTIONS_CHUNK, ACTION_DIM)
-
-        # Return final actions
-        return curr_noisy_actions.float().cpu().detach().numpy(), actions_hidden_states
+        """
+        Wrapper for diffusion prediction. Uses KV Cache version.
+        """
+        return self._run_diffusion_prediction_with_kv_cache(
+            input_embeddings=input_embeddings,
+            all_actions_mask=all_actions_mask,
+            action_head=action_head,
+            projected_patch_embeddings=projected_patch_embeddings,
+            attention_mask=attention_mask,
+            NUM_PATCHES=NUM_PATCHES,
+            NUM_PROMPT_TOKENS=NUM_PROMPT_TOKENS,
+        )
 
     def _regression_or_discrete_prediction(
         self,
@@ -1178,17 +1254,17 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             
         
 
-        # Use diffusion if provided, otherwise use regression or discrete prediction
-        use_diffusion = noisy_action_projector is not None and hasattr(action_head, "noise_scheduler")
+        # Use diffusion if provided - OpenPI style uses action_head with sample_actions method
+        use_diffusion = action_head is not None and hasattr(action_head, "sample_actions")
 
-        # Calculate number of patches (including proprio token and/or diffusion timestep embedding if present)
+        # Calculate number of patches (including proprio token)
+        # Note: OpenPI-style diffusion does NOT add timestep embedding to VLA input
         NUM_PATCHES = self.vision_backbone.get_num_patches() * self.vision_backbone.get_num_images_in_input()
         if use_proprio:
             NUM_PATCHES += 1
         if use_depth:
-            NUM_PATCHES +=2
-        if use_diffusion:
-            NUM_PATCHES += 1
+            NUM_PATCHES += 2
+        # Removed: if use_diffusion: NUM_PATCHES += 1  (no longer needed for openpi-style)
 
         if use_diffusion:
             # Sample random noise with shape equal to output action, used as the starting state for reverse diffusion

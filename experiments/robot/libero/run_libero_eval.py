@@ -185,10 +185,10 @@ def initialize_model(cfg: GenerateConfig):
     if cfg.use_l1_regression or cfg.use_diffusion:
         action_head = get_action_head(cfg, model.llm_dim)
 
-    # Load noisy action projector if using diffusion
+    # OpenPI-style: noisy_action_projector is no longer needed for diffusion
     noisy_action_projector = None
-    if cfg.use_diffusion:
-        noisy_action_projector = get_noisy_action_projector(cfg, model.llm_dim)
+    # if cfg.use_diffusion:
+    #     noisy_action_projector = get_noisy_action_projector(cfg, model.llm_dim)
 
     # Get OpenVLA processor if needed
     processor = None
